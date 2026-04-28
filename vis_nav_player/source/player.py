@@ -70,10 +70,16 @@ TARGET_CONSENSUS_ALERT = 2    # need N views above threshold for "NEAR TARGET" H
 TARGET_SIM_CHECKIN = 0.12     # (DISABLED — see see() — kept for HUD/test compatibility)
 TARGET_CONSENSUS_CHECKIN = 1
 AUTO_CHECKIN_CONFIRM = 1
-NEAR_GOAL_HOPS_CHECKIN = 8    # path-based CHECKIN when within N hops of goal candidate.
-                              # Tightened from 30 because correctness > speed:
-                              # 30 hops away can be 5+ meters off; 8 hops ≈ near-exact arrival.
-GOAL_VERIFY_MIN_SIM = 0.15    # at goal, require ≥ this sim somewhere in 360° scan to CHECKIN
+NEAR_GOAL_HOPS_CHECKIN = 25   # enter SEARCH (360° verify) when within N hops of candidate.
+                              # Was 8 — but path-replay under NOISY_MOTION drifts past the
+                              # peak before reaching exact arrival. Observed: target sim
+                              # peaked at 0.158 mid-approach then collapsed to 0.05 at hops=0.
+                              # 25 catches the approach window where sim is near peak.
+GOAL_VERIFY_MIN_SIM = 0.13    # 360° SEARCH CHECKIN threshold (low-conf goal). Was 0.18 —
+                              # too strict given trajectory's sustained peaks are 0.14–0.16.
+                              # Aliasing risk minimal because SEARCH only fires at hops ≤ 25
+                              # of a candidate (we're physically near where the trajectory
+                              # passed close to goal, not in a random corridor).
 
 # Legacy constants (kept for test compatibility)
 ACTION_HOLD_FRAMES = 15
@@ -92,11 +98,15 @@ APPROACH_HOPS_ENTER = 15       # enter APPROACH state when hops < this
 APPROACH_HOPS_EXIT = 20        # exit APPROACH back to NAVIGATE if hops >= this
 SEARCH_HOPS_ENTER = 3          # enter SEARCH state when hops <= this
 SEARCH_SIM_THRESHOLD = 0.20    # CHECKIN if max target sim > this
-SEARCH_SIM_LOW_CONF = 0.18     # lower threshold for low-confidence goals.
-                               # Was 0.12 — caused false-positive CHECKIN at aliased
-                               # corridors (we observed 0.137 fire wrong location).
-                               # Trajectory's best front-view sim is 0.22, so 0.18
-                               # demands we be very near goal physically before CHECKIN.
+SEARCH_SIM_LOW_CONF = 0.13     # lower threshold for low-confidence goals.
+                               # 0.12 was too lax (aliased corridor false-positives) —
+                               # but only because old visual-CHECKIN fired anywhere in
+                               # the maze. SEARCH only fires at hops ≤ 25 of a candidate
+                               # (physically near where trajectory approached goal), so
+                               # 0.13 here is much safer than 0.12 in see(). Observed
+                               # trajectory peaks during approach are 0.14–0.16; 0.18
+                               # was unreachable in practice and caused fallback CHECKINs
+                               # at drifted "arrival points" with sim ~0.05.
 BACKUP_CHECKIN_SIM = 0.30      # "lucky pass" CHECKIN during NAVIGATE/APPROACH
 LOW_CONF_BACKUP_CHECKIN_SIM = 0.45
 SEARCH_MAX_SCANS = 3           # max 360° scans before giving up
