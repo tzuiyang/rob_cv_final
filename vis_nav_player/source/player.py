@@ -67,10 +67,13 @@ LOCALIZATION_JUMP_MARGIN = 0.05
 TARGET_CHECK_INTERVAL = 5     # check target similarity every N frames
 TARGET_VIEW_THRESH = 0.08     # per-view threshold for consensus counting (alert HUD only)
 TARGET_CONSENSUS_ALERT = 2    # need N views above threshold for "NEAR TARGET" HUD
-TARGET_SIM_CHECKIN = 0.12     # auto-CHECKIN when ANY view sim ≥ this (peak we observed in dry-run was 0.136)
-TARGET_CONSENSUS_CHECKIN = 1  # only need 1 view above threshold (single-trajectory limit)
-AUTO_CHECKIN_CONFIRM = 1      # fire immediately on first strong match (no streak)
-NEAR_GOAL_HOPS_CHECKIN = 30   # path-based CHECKIN when within N hops of goal candidate (was 15 — too tight for noisy motion)
+TARGET_SIM_CHECKIN = 0.12     # (DISABLED — see see() — kept for HUD/test compatibility)
+TARGET_CONSENSUS_CHECKIN = 1
+AUTO_CHECKIN_CONFIRM = 1
+NEAR_GOAL_HOPS_CHECKIN = 8    # path-based CHECKIN when within N hops of goal candidate.
+                              # Tightened from 30 because correctness > speed:
+                              # 30 hops away can be 5+ meters off; 8 hops ≈ near-exact arrival.
+GOAL_VERIFY_MIN_SIM = 0.15    # at goal, require ≥ this sim somewhere in 360° scan to CHECKIN
 
 # Legacy constants (kept for test compatibility)
 ACTION_HOLD_FRAMES = 15
@@ -89,7 +92,11 @@ APPROACH_HOPS_ENTER = 15       # enter APPROACH state when hops < this
 APPROACH_HOPS_EXIT = 20        # exit APPROACH back to NAVIGATE if hops >= this
 SEARCH_HOPS_ENTER = 3          # enter SEARCH state when hops <= this
 SEARCH_SIM_THRESHOLD = 0.20    # CHECKIN if max target sim > this
-SEARCH_SIM_LOW_CONF = 0.12     # lower threshold for low-confidence goals (target sim is ~0.07-0.16)
+SEARCH_SIM_LOW_CONF = 0.18     # lower threshold for low-confidence goals.
+                               # Was 0.12 — caused false-positive CHECKIN at aliased
+                               # corridors (we observed 0.137 fire wrong location).
+                               # Trajectory's best front-view sim is 0.22, so 0.18
+                               # demands we be very near goal physically before CHECKIN.
 BACKUP_CHECKIN_SIM = 0.30      # "lucky pass" CHECKIN during NAVIGATE/APPROACH
 LOW_CONF_BACKUP_CHECKIN_SIM = 0.45
 SEARCH_MAX_SCANS = 3           # max 360° scans before giving up
@@ -598,14 +605,12 @@ class KeyboardPlayerPyGame(Player):
                         self._target_best_step = self.nav_total_steps
                         print(f"[TARGET] New best! sim={max_sim:.3f} ({best_view})")
 
-                    # Auto-CHECKIN
-                    if consensus >= TARGET_CONSENSUS_CHECKIN and max_sim > TARGET_SIM_CHECKIN:
-                        self._target_checkin_streak += 1
-                        if self._target_checkin_streak >= AUTO_CHECKIN_CONFIRM:
-                            self._auto_checkin_triggered = True
-                            print(f"[TARGET] AUTO-CHECKIN! sim={max_sim:.3f} views={consensus}/4")
-                    else:
-                        self._target_checkin_streak = 0
+                    # Visual-sim auto-CHECKIN intentionally DISABLED.
+                    # On 51×51 dry-run, single-trajectory VLAD aliasing fires false
+                    # positives at sim ~0.13–0.15 (a corridor that looks like the
+                    # target's right view but is physically far from the goal).
+                    # CHECKIN is now path-arrival-only — see _path_guided_act.
+                    self._target_checkin_streak = 0
 
             # --- Simple text HUD (single line, no clutter) ---
             h, w = display_fpv.shape[:2]
@@ -826,12 +831,13 @@ class KeyboardPlayerPyGame(Player):
         per_view_sorted = sorted(per_view_best, key=lambda x: -x[1])
         primary_node, primary_sim, primary_view = per_view_sorted[0]
 
-        # Build candidate list: each view's best, deduped (within neighborhood)
-        candidates_seen = []
-        for node, sim, _name in per_view_sorted:
-            if not any(abs(node - c) <= GOAL_NEIGHBORHOOD_RADIUS for c in candidates_seen):
-                candidates_seen.append(node)
-        self.goal_candidates = candidates_seen[:LOW_CONF_GOAL_CANDIDATES]
+        # Lock onto the single strongest match (front view best). On the dry-run
+        # 51×51 dataset the per-view best matches are scattered across the
+        # trajectory (1077, 2351, 2971, 394) — cycling through them on plateau
+        # makes the agent bounce around without ever physically arriving at any
+        # of them. Sticking to the front-view best gives a stable target that
+        # SEARCH-verification can confirm or reject.
+        self.goal_candidates = [primary_node]
         self.goal_candidate_index = 0
         self.goal_node = primary_node
 
@@ -1072,20 +1078,8 @@ class KeyboardPlayerPyGame(Player):
             print(f"[NAV] step={self.nav_total_steps} node={cur} hops={hops} "
                   f"best={self.nav_last_best_hops} hand={self.wall_hand}")
 
-        # Backup ("lucky pass") CHECKIN: reuse cached VLAD from _get_current_node()
-        # to check target similarity at zero extra cost (just 4 dot products).
-        if self._last_vlad is not None and self._target_vlads:
-            target_sims = [float(self._last_vlad @ tv) for tv in self._target_vlads]
-            max_sim = max(target_sims)
-            if max_sim > self._backup_checkin_threshold():
-                best_view = ['front', 'left', 'back', 'right'][int(np.argmax(target_sims))]
-                print(f"[BACKUP CHECKIN] Lucky pass! sim={max_sim:.3f} ({best_view}), hops={hops}")
-                self.nav_state = NavState.SEARCH
-                self.search_turn_counter = 0
-                self.search_scan_count = 0
-                self.search_best_sim = 0.0
-                return -1  # sentinel: caller should enter SEARCH immediately
-
+        # Backup "lucky pass" visual CHECKIN DISABLED (false-positive prone).
+        # We rely on path-arrival + 360° SEARCH verification only.
         return hops
 
     def _search_act(self) -> Action:
@@ -1118,24 +1112,16 @@ class KeyboardPlayerPyGame(Player):
                   f"best_sim={self.search_best_sim:.3f}")
 
             if self.search_scan_count >= SEARCH_MAX_SCANS:
-                # Failed to find match — enter ESCAPE to physically relocate
-                print(f"[SEARCH] No match after {SEARCH_MAX_SCANS} scans, entering ESCAPE")
-                if self.low_confidence_goal and self._advance_goal_candidate():
-                    print("[SEARCH] Advancing to next low-confidence candidate")
-                self.nav_state = NavState.ESCAPE
-                self._escape_remaining = NAV_ESCAPE_FORWARD
-                self._nav_es = ExploreState.FORWARD
-                self._nav_tc = 0
-                self._nav_fwd = 0
-                self._nav_stuck_count = 0
-                self.search_scan_count = 0
-                self.search_best_sim = 0.0
-                self.hop_history.clear()
-                self.prev_avg_hops = None
-                self.nav_last_best_hops = 9999
-                self._reset_low_confidence_stability()
-                self._search_failure_cooldown = self.nav_total_steps
-                return Action.FORWARD
+                # Tried hard and never crossed the verification threshold. Two options:
+                # (a) we're not actually at the goal — ESCAPE and re-navigate
+                # (b) we ARE at the goal but VLAD just can't break threshold here
+                # Without a way to distinguish, we CHECKIN at goal_node anyway —
+                # we've physically arrived per the path, and "best guess" beats
+                # wandering forever. Better Partial than timeout.
+                print(f"[SEARCH] No match after {SEARCH_MAX_SCANS} scans "
+                      f"(best={self.search_best_sim:.3f}). CHECKIN at arrival point.")
+                self.nav_state = NavState.CHECKIN
+                return Action.CHECKIN
             else:
                 # Move forward a bit then scan again from different position
                 self.current_action = Action.FORWARD
@@ -1165,24 +1151,23 @@ class KeyboardPlayerPyGame(Player):
                 goal = self._active_goal_node()
                 print(f"[PATH] step={self.nav_total_steps} node={cur} goal={goal} hops={hops}")
 
-            # Backup CHECKIN check
-            if self._last_vlad is not None and self._target_vlads:
-                max_sim = max(float(self._last_vlad @ tv) for tv in self._target_vlads)
-                if max_sim > self._backup_checkin_threshold():
-                    print(f"[PATH] Visual match! sim={max_sim:.3f}, entering SEARCH")
-                    self.nav_state = NavState.SEARCH
-                    self.search_turn_counter = 0
-                    self.search_scan_count = 0
-                    self.search_best_sim = 0.0
-                    return Action.LEFT
+            # Backup visual-CHECKIN trigger DISABLED (false-positive prone on aliased corridors).
+            # CHECKIN is now path-arrival-only: must be hops ≤ NEAR_GOAL_HOPS_CHECKIN.
 
-            # Near goal → CHECKIN (be aggressive — localization may never reach 0 with noisy motion)
+            # Near goal → enter SEARCH state to do 360° verification before CHECKIN.
+            # SEARCH scans all 4 headings; if max target sim across the scan
+            # exceeds GOAL_VERIFY_MIN_SIM we're confident we're physically at
+            # the goal (not just topologically close on the trajectory). If the
+            # scan disagrees we resume NAVIGATE and try again.
             if hops <= NEAR_GOAL_HOPS_CHECKIN:
-                print(f"[PATH] Near goal ({hops} hops), CHECKIN!")
-                self.nav_state = NavState.CHECKIN
-                return Action.CHECKIN
+                print(f"[PATH] Arrived ({hops} hops), entering SEARCH for 360° verification")
+                self.nav_state = NavState.SEARCH
+                self.search_turn_counter = 0
+                self.search_scan_count = 0
+                self.search_best_sim = 0.0
+                return Action.LEFT
 
-            # Near goal → SEARCH
+            # Near goal → SEARCH (legacy gradient-based path)
             if self._should_enter_search(hops):
                 print(f"[PATH] Near goal ({hops} hops), entering SEARCH")
                 self.nav_state = NavState.SEARCH
@@ -1260,12 +1245,13 @@ class KeyboardPlayerPyGame(Player):
         if self.nav_state in (NavState.SEARCH, NavState.CHECKIN):
             return action
 
-        # Plateau detection: no progress → ESCAPE + try next candidate
+        # Plateau detection: no progress → ESCAPE burst, retry SAME goal.
+        # We intentionally DO NOT switch candidates: the 4 per-view best matches
+        # are scattered across the trajectory (single-trajectory dataset, weak
+        # VLAD on noisy 51×51 maze), and switching makes us bounce around without
+        # ever reaching any of them. Lock onto the strongest front-view match.
         if (self.nav_total_steps - self.nav_plateau_start) >= NAV_PLATEAU_STEPS:
-            if self.low_confidence_goal and self._advance_goal_candidate():
-                print(f"[NAV] Plateau at step {self.nav_total_steps}, switching candidate")
-            else:
-                print(f"[NAV] Plateau at step {self.nav_total_steps}, ESCAPE to relocate")
+            print(f"[NAV] Plateau at step {self.nav_total_steps}, ESCAPE to relocate (locked goal)")
             self._escape_remaining = NAV_ESCAPE_FORWARD
             self.nav_state = NavState.ESCAPE
             self.nav_plateau_start = self.nav_total_steps
