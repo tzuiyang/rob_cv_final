@@ -122,6 +122,13 @@ CLOSE_HOPS_NO_SWITCH = 30      # if best_hops < this, never switch candidate on
                                # plateau — we're already close, just retry.
                                # Observed: agent reached 17 hops then switched
                                # to a candidate 100+ hops away and timed out.
+GEOM_VERIFY_MIN_INLIERS = 15       # SIFT/RANSAC: require ≥ this many geometrically
+                                   # consistent keypoint matches between FPV and the
+                                   # target view to accept CHECKIN. Aliased corridors
+                                   # produce ~3-5 random inliers; real same-place
+                                   # pairs typically produce 30+. 15 cleanly separates.
+GEOM_VERIFY_LOWE_RATIO = 0.75      # Lowe's ratio test for SIFT matching
+GEOM_VERIFY_RANSAC_THRESH = 5.0    # RANSAC reprojection threshold (pixels)
 VISUAL_SEARCH_TRIGGER_SIM = 0.12   # when target sim crosses this anywhere in
                                    # the run, enter SEARCH at current location to
                                    # 360°-verify. Was 0.15 — but observed peaks
@@ -926,6 +933,18 @@ class KeyboardPlayerPyGame(Player):
         # Cache target VLADs for fast multi-view CHECKIN
         self._target_vlads = [self.extractor.extract(t) for t in targets]
 
+        # Cache target SIFT keypoints+descriptors for geometric verification.
+        # VLAD alone is fooled by aliased corridors (similar global statistics,
+        # different scenes). RANSAC inlier count on real keypoint matches
+        # cleanly separates real same-place pairs (~30+ inliers) from aliased
+        # pairs (~3–5 random inliers).
+        self._target_kp_des = []
+        for t in targets[:4]:
+            gray = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+            kp, des = self.extractor.sift.detectAndCompute(gray, None)
+            self._target_kp_des.append((kp, des))
+            print(f"  target SIFT: {len(kp)} keypoints")
+
         print(f"Goal: node {self.goal_node} (avg_sim={avg_sim:.4f}, d={d:.4f}, consensus={consensus}/4)")
         if self.low_confidence_goal and self.goal_candidates:
             print(f"Goal candidates: {self.goal_candidates}")
@@ -1161,10 +1180,26 @@ class KeyboardPlayerPyGame(Player):
 
             threshold = SEARCH_SIM_LOW_CONF if self.low_confidence_goal else SEARCH_SIM_THRESHOLD
             if max_sim > threshold:
-                print(f"[SEARCH] CHECKIN! sim={max_sim:.3f} ({best_view})")
-                self._save_checkin_snapshot(reason=f"verified sim={max_sim:.3f} ({best_view})")
-                self.nav_state = NavState.CHECKIN
-                return Action.CHECKIN
+                # VLAD passed. Now run SIFT/RANSAC geometric verification —
+                # the actual test for "are we looking at the same physical
+                # scene as the target?" VLAD's global statistics are easily
+                # fooled by aliased corridors; keypoint geometry is not.
+                best_idx = int(np.argmax(target_sims))
+                inliers = self._geom_verify(self.fpv, best_idx)
+                if inliers >= GEOM_VERIFY_MIN_INLIERS:
+                    print(f"[SEARCH] CHECKIN! sim={max_sim:.3f} ({best_view}) "
+                          f"+ geom inliers={inliers}")
+                    self._save_checkin_snapshot(
+                        reason=f"verified sim={max_sim:.3f} ({best_view}), "
+                               f"inliers={inliers}")
+                    self.nav_state = NavState.CHECKIN
+                    return Action.CHECKIN
+                else:
+                    # VLAD said yes, geometry said no — aliased pattern.
+                    # Don't CHECKIN; keep scanning.
+                    print(f"[SEARCH] VLAD sim={max_sim:.3f} ({best_view}) but "
+                          f"geom inliers={inliers} < {GEOM_VERIFY_MIN_INLIERS} — "
+                          f"aliased; keep scanning")
 
         # Full 360° rotation completed?
         scan_steps = TURN_STEPS_90 * 4
@@ -1542,6 +1577,53 @@ class KeyboardPlayerPyGame(Player):
         return Action.FORWARD
 
     # --- Display ---
+
+    def _geom_verify(self, fpv: np.ndarray, target_idx: int) -> int:
+        """SIFT/RANSAC geometric verification: count inlier keypoint matches
+        between current FPV and target view at index target_idx.
+
+        Returns the number of geometrically-consistent inliers. ≥ 15 means
+        we are very likely actually looking at the same physical scene
+        (not just an aliased corridor with similar global statistics).
+        Returns 0 on any failure (no SIFT, too few matches, no homography).
+        """
+        try:
+            if (self._target_kp_des is None
+                    or target_idx >= len(self._target_kp_des)):
+                return 0
+            tgt_kp, tgt_des = self._target_kp_des[target_idx]
+            if tgt_des is None or len(tgt_des) < 4:
+                return 0
+
+            fpv_gray = cv2.cvtColor(fpv, cv2.COLOR_BGR2GRAY)
+            fpv_kp, fpv_des = self.extractor.sift.detectAndCompute(fpv_gray, None)
+            if fpv_des is None or len(fpv_des) < 4:
+                return 0
+
+            # Match descriptors with Lowe's ratio test
+            bf = cv2.BFMatcher(cv2.NORM_L2)
+            knn = bf.knnMatch(fpv_des, tgt_des, k=2)
+            good = []
+            for pair in knn:
+                if len(pair) < 2:
+                    continue
+                m, n = pair
+                if m.distance < GEOM_VERIFY_LOWE_RATIO * n.distance:
+                    good.append(m)
+            if len(good) < 4:
+                return 0
+
+            src = np.float32([fpv_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst = np.float32([tgt_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            H, mask = cv2.findHomography(src, dst, cv2.RANSAC,
+                                          GEOM_VERIFY_RANSAC_THRESH)
+            if mask is None:
+                return 0
+            inliers = int(mask.sum())
+            return inliers
+        except Exception as e:
+            print(f"[GEOM] verify failed: {e}")
+            return 0
 
     def _save_checkin_snapshot(self, reason: str = ""):
         """Save side-by-side: agent FPV at CHECKIN + 4 target views.
