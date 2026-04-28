@@ -1162,6 +1162,7 @@ class KeyboardPlayerPyGame(Player):
             threshold = SEARCH_SIM_LOW_CONF if self.low_confidence_goal else SEARCH_SIM_THRESHOLD
             if max_sim > threshold:
                 print(f"[SEARCH] CHECKIN! sim={max_sim:.3f} ({best_view})")
+                self._save_checkin_snapshot(reason=f"verified sim={max_sim:.3f} ({best_view})")
                 self.nav_state = NavState.CHECKIN
                 return Action.CHECKIN
 
@@ -1194,6 +1195,8 @@ class KeyboardPlayerPyGame(Player):
                     # better Partial than timeout.
                     print(f"[SEARCH] No match after {SEARCH_MAX_SCANS} scans "
                           f"(best={self.search_best_sim:.3f}). CHECKIN at arrival point.")
+                    self._save_checkin_snapshot(
+                        reason=f"fallback (best scan={self.search_best_sim:.3f})")
                     self.nav_state = NavState.CHECKIN
                     return Action.CHECKIN
             else:
@@ -1539,6 +1542,49 @@ class KeyboardPlayerPyGame(Player):
         return Action.FORWARD
 
     # --- Display ---
+
+    def _save_checkin_snapshot(self, reason: str = ""):
+        """Save side-by-side: agent FPV at CHECKIN + 4 target views.
+        Lets you eyeball post-game whether we're at the goal location.
+        Saved to data/save/verify_<timestamp>.jpg next to the .npy.
+        """
+        try:
+            if self.fpv is None:
+                return
+            targets = self.get_target_images()
+            if not targets or len(targets) < 4:
+                return
+
+            view_names = ['front', 'left', 'back', 'right']
+            h, w = self.fpv.shape[:2]
+            # Resize all panels to FPV size
+            target_panels = [cv2.resize(t, (w, h)) for t in targets[:4]]
+
+            # Top: FPV (full width = 4*w, centered)
+            top = np.zeros((h, 4 * w, 3), dtype=np.uint8)
+            top[:, (4 * w - w) // 2:(4 * w - w) // 2 + w] = self.fpv
+            # Bottom: 4 target images side-by-side
+            bot = np.hstack(target_panels)
+
+            img = np.vstack([top, bot])
+
+            # Annotations
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(img, f"Agent FPV at CHECKIN ({reason})",
+                        (10, 25), font, 0.7, (0, 255, 0), 2)
+            for i, name in enumerate(view_names):
+                cv2.putText(img, name.upper(),
+                            (i * w + 10, h + 25), font, 0.7, (0, 255, 255), 2)
+
+            save_dir = os.path.join(self.data_dir, "save")
+            os.makedirs(save_dir, exist_ok=True)
+            from datetime import datetime
+            fname = os.path.join(save_dir,
+                                 f"verify_{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg")
+            cv2.imwrite(fname, img)
+            print(f"[VERIFY] Saved CHECKIN snapshot -> {fname}")
+        except Exception as e:
+            print(f"[VERIFY] Failed to save snapshot: {e}")
 
     def show_target_images(self):
         targets = self.get_target_images()
