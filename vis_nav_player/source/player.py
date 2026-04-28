@@ -61,13 +61,16 @@ LOCALIZATION_SEARCH_RADIUS = 80
 LOCALIZATION_JUMP_THRESHOLD = 150
 LOCALIZATION_JUMP_MARGIN = 0.05
 
-# Manual navigation with auto-target detection
+# Auto-target detection (CHECKIN aggressiveness — tuned for 51×51 dry-run where
+# trajectory only sees the goal location from ONE direction, so multi-view
+# consensus is impossible and we must fire on a single strong view).
 TARGET_CHECK_INTERVAL = 5     # check target similarity every N frames
-TARGET_VIEW_THRESH = 0.08     # per-view threshold for consensus counting
-TARGET_CONSENSUS_ALERT = 2    # need N views above threshold for "NEAR TARGET"
-TARGET_SIM_CHECKIN = 0.12     # auto-CHECKIN when max_sim > this AND consensus met
-TARGET_CONSENSUS_CHECKIN = 3  # need N views above threshold for auto-CHECKIN
-AUTO_CHECKIN_CONFIRM = 3      # consecutive checks above threshold to trigger
+TARGET_VIEW_THRESH = 0.08     # per-view threshold for consensus counting (alert HUD only)
+TARGET_CONSENSUS_ALERT = 2    # need N views above threshold for "NEAR TARGET" HUD
+TARGET_SIM_CHECKIN = 0.12     # auto-CHECKIN when ANY view sim ≥ this (peak we observed in dry-run was 0.136)
+TARGET_CONSENSUS_CHECKIN = 1  # only need 1 view above threshold (single-trajectory limit)
+AUTO_CHECKIN_CONFIRM = 1      # fire immediately on first strong match (no streak)
+NEAR_GOAL_HOPS_CHECKIN = 30   # path-based CHECKIN when within N hops of goal candidate (was 15 — too tight for noisy motion)
 
 # Legacy constants (kept for test compatibility)
 ACTION_HOLD_FRAMES = 15
@@ -370,6 +373,7 @@ class KeyboardPlayerPyGame(Player):
         self._target_max_sim = 0.0
         self._target_consensus = 0
         self._target_best_ever = 0.0
+        self._target_best_step = 0
         self._target_checkin_streak = 0
         self._target_check_counter = 0
         self._auto_checkin_triggered = False
@@ -519,14 +523,18 @@ class KeyboardPlayerPyGame(Player):
             self.last_explore_action = ACTION_NAMES.get(action, 'IDLE')
             return action
 
-        # === MANUAL NAVIGATION with auto-target detection ===
+        # === AUTO NAVIGATION (with manual override + auto-target detection) ===
         # Auto-CHECKIN if target detected
         if self._auto_checkin_triggered:
             print("[AUTO-CHECKIN] Target confirmed! Checking in...")
             return Action.CHECKIN
 
-        # Manual keyboard control
-        return self.last_act
+        # Manual override: if user is holding any arrow key, take it
+        if self.last_act != Action.IDLE:
+            return self.last_act
+
+        # Otherwise, auto-navigate via Dijkstra path-following
+        return self._auto_navigate()
 
     def see(self, fpv):
         if fpv is None or len(fpv.shape) < 3:
@@ -587,6 +595,7 @@ class KeyboardPlayerPyGame(Player):
                         self._target_best_ever = max_sim
                         view_names = ['front', 'left', 'back', 'right']
                         best_view = view_names[int(np.argmax(target_sims))]
+                        self._target_best_step = self.nav_total_steps
                         print(f"[TARGET] New best! sim={max_sim:.3f} ({best_view})")
 
                     # Auto-CHECKIN
@@ -798,32 +807,43 @@ class KeyboardPlayerPyGame(Player):
 
         all_sims = []
         view_names = ['front', 'left', 'back', 'right']
+        per_view_best = []  # list of (best_node, best_sim, view_name)
         for i, target in enumerate(targets):
             vlad = self.extractor.extract(target)
             sims = self.database @ vlad
             all_sims.append(sims)
             best_node = int(np.argmax(sims))
             best_sim = float(sims[best_node])
+            per_view_best.append((best_node, best_sim, view_names[i]))
             print(f"  {view_names[i]}: best node {best_node}, sim={best_sim:.4f}")
 
-        raw_scores = np.mean(all_sims, axis=0)
-        smoothed = np.array([
-            self._smooth_similarity_curve(sims, GOAL_NEIGHBORHOOD_RADIUS)
-            for sims in all_sims
-        ])
-        goal_scores = 0.7 * raw_scores + 0.3 * np.mean(smoothed, axis=0)
-        self.goal_candidates = self._select_goal_candidates(
-            goal_scores,
-            count=LOW_CONF_GOAL_CANDIDATES,
-            separation=LOW_CONF_GOAL_SEPARATION,
-        )
+        # PRIMARY GOAL: the per-view single best match (front view typically wins —
+        # that's the trajectory frame closest to where target was photographed).
+        # Averaging across views is unreliable: when the trajectory passes the goal
+        # only once, only one view matches strongly to a local trajectory window;
+        # the other views match elsewhere in the trajectory, and the mean picks
+        # something nobody likes.
+        per_view_sorted = sorted(per_view_best, key=lambda x: -x[1])
+        primary_node, primary_sim, primary_view = per_view_sorted[0]
+
+        # Build candidate list: each view's best, deduped (within neighborhood)
+        candidates_seen = []
+        for node, sim, _name in per_view_sorted:
+            if not any(abs(node - c) <= GOAL_NEIGHBORHOOD_RADIUS for c in candidates_seen):
+                candidates_seen.append(node)
+        self.goal_candidates = candidates_seen[:LOW_CONF_GOAL_CANDIDATES]
         self.goal_candidate_index = 0
-        self.goal_node = self.goal_candidates[0] if self.goal_candidates else int(np.argmax(goal_scores))
-        self.goal_candidate_scores = {
-            idx: float(goal_scores[idx]) for idx in self.goal_candidates
-        }
+        self.goal_node = primary_node
+
+        # Score each candidate by its strongest per-view sim (used for low-conf cycling)
+        self.goal_candidate_scores = {}
+        for c in self.goal_candidates:
+            best_view_sim = max(float(sims[c]) for sims in all_sims)
+            self.goal_candidate_scores[c] = best_view_sim
+
         avg_sim = float(np.mean([sims[self.goal_node] for sims in all_sims]))
-        d = float(np.sqrt(max(0, 2 - 2 * avg_sim)))
+        d = float(np.sqrt(max(0, 2 - 2 * primary_sim)))
+        print(f"  -> Picked goal via best single view: {primary_view} -> node {primary_node} (sim={primary_sim:.4f})")
 
         consensus = sum(1 for sims in all_sims
                         if abs(int(np.argmax(sims)) - self.goal_node) <= GOAL_NEIGHBORHOOD_RADIUS)
@@ -1157,7 +1177,7 @@ class KeyboardPlayerPyGame(Player):
                     return Action.LEFT
 
             # Near goal → CHECKIN (be aggressive — localization may never reach 0 with noisy motion)
-            if hops <= 15:
+            if hops <= NEAR_GOAL_HOPS_CHECKIN:
                 print(f"[PATH] Near goal ({hops} hops), CHECKIN!")
                 self.nav_state = NavState.CHECKIN
                 return Action.CHECKIN
