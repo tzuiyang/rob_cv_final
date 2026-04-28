@@ -121,6 +121,14 @@ CLOSE_HOPS_NO_SWITCH = 30      # if best_hops < this, never switch candidate on
                                # plateau — we're already close, just retry.
                                # Observed: agent reached 17 hops then switched
                                # to a candidate 100+ hops away and timed out.
+VISUAL_SEARCH_TRIGGER_SIM = 0.15   # when target sim crosses this anywhere in
+                                   # the run, enter SEARCH at current location to
+                                   # 360°-verify (catches mid-recovery peaks that
+                                   # path-arrival SEARCH would miss). Verification
+                                   # threshold is still SEARCH_SIM_LOW_CONF (0.13).
+VISUAL_SEARCH_COOLDOWN_CHECKS = 30 # how many target-sim checks (each = 20 frames)
+                                   # to wait before retriggering visual SEARCH —
+                                   # avoids re-entering on the same peak repeatedly.
 HAND_LEFT = "left"
 HAND_RIGHT = "right"
 LOW_CONF_AVG_SIM_THRESHOLD = 0.25
@@ -401,6 +409,13 @@ class KeyboardPlayerPyGame(Player):
         self._target_best_step = 0
         self._target_checkin_streak = 0
         self._target_check_counter = 0
+        # SEARCH trigger flag: True if SEARCH was entered via a visual-sim peak
+        # (vs path arrival). Visual-trigger SEARCHes that fail verification
+        # resume NAVIGATE instead of falling back to CHECKIN — they might be
+        # aliased corridor matches, not real goal arrivals.
+        self._search_is_visual_trigger = False
+        # Cooldown to avoid re-triggering visual SEARCH too frequently
+        self._visual_search_cooldown = 0
         self._auto_checkin_triggered = False
         # Simple "been here" tracking: buffer of saved frame snapshots
         self._visit_buffer = []             # list of small grayscale frames (80x60)
@@ -623,12 +638,31 @@ class KeyboardPlayerPyGame(Player):
                         self._target_best_step = self.nav_total_steps
                         print(f"[TARGET] New best! sim={max_sim:.3f} ({best_view})")
 
-                    # Visual-sim auto-CHECKIN intentionally DISABLED.
-                    # On 51×51 dry-run, single-trajectory VLAD aliasing fires false
-                    # positives at sim ~0.13–0.15 (a corridor that looks like the
-                    # target's right view but is physically far from the goal).
-                    # CHECKIN is now path-arrival-only — see _path_guided_act.
+                    # Visual-sim direct CHECKIN stays DISABLED (false-positive prone).
+                    # But: when sim spikes high, enter SEARCH at this physical
+                    # location. SEARCH does a 360° scan; if any direction also
+                    # matches a target view ≥ SEARCH_SIM_LOW_CONF, CHECKIN.
+                    # If 3 scans don't verify, this was an aliased pattern —
+                    # resume NAVIGATE (no fallback CHECKIN, since unlike
+                    # path-arrival we have no other reason to trust this is goal).
                     self._target_checkin_streak = 0
+                    if self._visual_search_cooldown > 0:
+                        self._visual_search_cooldown -= 1
+                    if (max_sim >= VISUAL_SEARCH_TRIGGER_SIM
+                            and self._visual_search_cooldown == 0
+                            and self.nav_state not in (NavState.SEARCH, NavState.CHECKIN)
+                            and self.pipeline_ready):
+                        view_names = ['front', 'left', 'back', 'right']
+                        best_view = view_names[int(np.argmax(target_sims))]
+                        print(f"[VISUAL] Peak sim={max_sim:.3f} ({best_view}) — "
+                              f"entering SEARCH for 360° verification")
+                        self.nav_state = NavState.SEARCH
+                        self.search_turn_counter = 0
+                        self.search_scan_count = 0
+                        self.search_best_sim = 0.0
+                        self._search_is_visual_trigger = True
+                        # cooldown to avoid retriggering the same peak repeatedly
+                        self._visual_search_cooldown = VISUAL_SEARCH_COOLDOWN_CHECKS
 
             # --- Simple text HUD (single line, no clutter) ---
             h, w = display_fpv.shape[:2]
@@ -1133,16 +1167,28 @@ class KeyboardPlayerPyGame(Player):
                   f"best_sim={self.search_best_sim:.3f}")
 
             if self.search_scan_count >= SEARCH_MAX_SCANS:
-                # Tried hard and never crossed the verification threshold. Two options:
-                # (a) we're not actually at the goal — ESCAPE and re-navigate
-                # (b) we ARE at the goal but VLAD just can't break threshold here
-                # Without a way to distinguish, we CHECKIN at goal_node anyway —
-                # we've physically arrived per the path, and "best guess" beats
-                # wandering forever. Better Partial than timeout.
-                print(f"[SEARCH] No match after {SEARCH_MAX_SCANS} scans "
-                      f"(best={self.search_best_sim:.3f}). CHECKIN at arrival point.")
-                self.nav_state = NavState.CHECKIN
-                return Action.CHECKIN
+                if self._search_is_visual_trigger:
+                    # Visual peak triggered SEARCH but 3 scans didn't verify.
+                    # Likely an aliased corridor that pattern-matched a target
+                    # view briefly. Don't CHECKIN — resume NAVIGATE and keep
+                    # heading toward the path goal.
+                    print(f"[SEARCH] Visual-trigger SEARCH failed verification "
+                          f"(best={self.search_best_sim:.3f}). Aliased pattern, "
+                          f"resuming NAVIGATE.")
+                    self._search_is_visual_trigger = False
+                    self.search_scan_count = 0
+                    self.search_best_sim = 0.0
+                    self.nav_state = NavState.NAVIGATE
+                    self._nav_path = None  # force replan
+                    return Action.FORWARD
+                else:
+                    # Path-arrival SEARCH: we physically arrived per Dijkstra,
+                    # but VLAD couldn't verify. Best-guess CHECKIN here —
+                    # better Partial than timeout.
+                    print(f"[SEARCH] No match after {SEARCH_MAX_SCANS} scans "
+                          f"(best={self.search_best_sim:.3f}). CHECKIN at arrival point.")
+                    self.nav_state = NavState.CHECKIN
+                    return Action.CHECKIN
             else:
                 # Move forward a bit then scan again from different position
                 self.current_action = Action.FORWARD
@@ -1186,6 +1232,7 @@ class KeyboardPlayerPyGame(Player):
                 self.search_turn_counter = 0
                 self.search_scan_count = 0
                 self.search_best_sim = 0.0
+                self._search_is_visual_trigger = False  # path arrival: fallback CHECKIN allowed
                 return Action.LEFT
 
             # Hard timeout: agent might never physically reach goal_node under
@@ -1200,6 +1247,7 @@ class KeyboardPlayerPyGame(Player):
                 self.search_turn_counter = 0
                 self.search_scan_count = 0
                 self.search_best_sim = 0.0
+                self._search_is_visual_trigger = False  # timeout fallback: CHECKIN allowed
                 return Action.LEFT
 
             # Near goal → SEARCH (legacy gradient-based path)
