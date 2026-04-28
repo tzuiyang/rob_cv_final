@@ -107,6 +107,10 @@ NAV_HARD_TIMEOUT_STEPS = 12000 # absolute max nav steps before forced CHECKIN.
                                # If we never arrive at goal_node, fire SEARCH at
                                # current location: best guess > game timeout.
                                # ~6–10 min of game time at typical engine pace.
+CLOSE_HOPS_NO_SWITCH = 30      # if best_hops < this, never switch candidate on
+                               # plateau — we're already close, just retry.
+                               # Observed: agent reached 17 hops then switched
+                               # to a candidate 100+ hops away and timed out.
 HAND_LEFT = "left"
 HAND_RIGHT = "right"
 LOW_CONF_AVG_SIM_THRESHOLD = 0.25
@@ -1266,12 +1270,18 @@ class KeyboardPlayerPyGame(Player):
         if self.nav_state in (NavState.SEARCH, NavState.CHECKIN):
             return action
 
-        # Plateau detection: no progress → ESCAPE burst + try next candidate.
-        # Cycling between candidates is safe now that visual-sim CHECKIN is gone:
-        # SEARCH-verification (sim ≥ 0.18) at each candidate gates CHECKIN,
-        # so reaching a wrong candidate just gets rejected, not false-CHECKIN'd.
+        # Plateau detection: no progress → ESCAPE burst + maybe try next candidate.
+        # CRITICAL: never abandon a close approach. If best_hops < CLOSE_HOPS_NO_SWITCH
+        # we're nearly arrived; plateau means "small recovery, keep trying" not
+        # "switch to a candidate hundreds of hops away." We observed exactly this
+        # bug: agent reached 17 hops then plateau-switched to candidate 2 which
+        # was 100+ hops away and ran out the clock without arriving.
         if (self.nav_total_steps - self.nav_plateau_start) >= NAV_PLATEAU_STEPS:
-            if self.low_confidence_goal and self._advance_goal_candidate():
+            close_to_current = self.nav_last_best_hops < CLOSE_HOPS_NO_SWITCH
+            if close_to_current:
+                print(f"[NAV] Plateau at step {self.nav_total_steps} but close "
+                      f"(best={self.nav_last_best_hops} hops). ESCAPE + retry SAME candidate.")
+            elif self.low_confidence_goal and self._advance_goal_candidate():
                 print(f"[NAV] Plateau at step {self.nav_total_steps}, switching candidate")
             else:
                 print(f"[NAV] Plateau at step {self.nav_total_steps}, ESCAPE to relocate")
