@@ -98,37 +98,44 @@ APPROACH_HOPS_ENTER = 15       # enter APPROACH state when hops < this
 APPROACH_HOPS_EXIT = 20        # exit APPROACH back to NAVIGATE if hops >= this
 SEARCH_HOPS_ENTER = 3          # enter SEARCH state when hops <= this
 SEARCH_SIM_THRESHOLD = 0.20    # CHECKIN if max target sim > this
-SEARCH_SIM_LOW_CONF = 0.13     # lower threshold for low-confidence goals.
-                               # 0.12 was too lax (aliased corridor false-positives) —
-                               # but only because old visual-CHECKIN fired anywhere in
-                               # the maze. SEARCH only fires at hops ≤ 25 of a candidate
-                               # (physically near where trajectory approached goal), so
-                               # 0.13 here is much safer than 0.12 in see(). Observed
-                               # trajectory peaks during approach are 0.14–0.16; 0.18
-                               # was unreachable in practice and caused fallback CHECKINs
-                               # at drifted "arrival points" with sim ~0.05.
+SEARCH_SIM_LOW_CONF = 0.11     # SEARCH 360°-scan verify threshold (low-conf goal).
+                               # If any direction in the scan reaches this sim,
+                               # CHECKIN there. 0.13 was missing the achievable
+                               # peaks (0.13x on this dataset). 0.11 is the
+                               # absolute floor; tighter than the aliased
+                               # false-positive level (~0.10) but reachable
+                               # at near-goal positions. Aliasing protected by
+                               # the visual-trigger cooldown + 360° geometry.
 BACKUP_CHECKIN_SIM = 0.30      # "lucky pass" CHECKIN during NAVIGATE/APPROACH
 LOW_CONF_BACKUP_CHECKIN_SIM = 0.45
 SEARCH_MAX_SCANS = 3           # max 360° scans before giving up
 NAV_DIRECTION_COOLDOWN = 500   # min steps between hand flips (counts frames)
 NAV_PLATEAU_STEPS = 2000       # steps without progress before trying next candidate
 NAV_ESCAPE_FORWARD = 150       # steps in escape burst to leave area
-NAV_HARD_TIMEOUT_STEPS = 12000 # absolute max nav steps before forced CHECKIN.
-                               # If we never arrive at goal_node, fire SEARCH at
-                               # current location: best guess > game timeout.
-                               # ~6–10 min of game time at typical engine pace.
+NAV_HARD_TIMEOUT_STEPS = 20000 # absolute max nav steps before forced CHECKIN.
+                               # Raised from 12000 — agent kept timing out
+                               # before peak detection caught fire. With looser
+                               # visual-trigger thresholds, more time means more
+                               # peak-trigger opportunities, less likely to fall
+                               # back to the (sim ~0.05) timeout-location CHECKIN.
 CLOSE_HOPS_NO_SWITCH = 30      # if best_hops < this, never switch candidate on
                                # plateau — we're already close, just retry.
                                # Observed: agent reached 17 hops then switched
                                # to a candidate 100+ hops away and timed out.
-VISUAL_SEARCH_TRIGGER_SIM = 0.15   # when target sim crosses this anywhere in
+VISUAL_SEARCH_TRIGGER_SIM = 0.12   # when target sim crosses this anywhere in
                                    # the run, enter SEARCH at current location to
-                                   # 360°-verify (catches mid-recovery peaks that
-                                   # path-arrival SEARCH would miss). Verification
-                                   # threshold is still SEARCH_SIM_LOW_CONF (0.13).
-VISUAL_SEARCH_COOLDOWN_CHECKS = 30 # how many target-sim checks (each = 20 frames)
+                                   # 360°-verify. Was 0.15 — but observed peaks
+                                   # are 0.13–0.14 in practice on this dataset,
+                                   # so 0.15 was unreachable. False-positive risk
+                                   # is bounded because SEARCH still requires
+                                   # the 360° scan to verify (sim ≥ 0.11 in any
+                                   # direction); aliased corridors typically
+                                   # match in one direction only.
+VISUAL_SEARCH_COOLDOWN_CHECKS = 10 # how many target-sim checks (each = 20 frames)
                                    # to wait before retriggering visual SEARCH —
                                    # avoids re-entering on the same peak repeatedly.
+                                   # Was 30 — too long; agent could miss
+                                   # subsequent peak crossings while in cooldown.
 HAND_LEFT = "left"
 HAND_RIGHT = "right"
 LOW_CONF_AVG_SIM_THRESHOLD = 0.25
