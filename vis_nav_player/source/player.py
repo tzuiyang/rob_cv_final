@@ -103,6 +103,10 @@ SEARCH_MAX_SCANS = 3           # max 360° scans before giving up
 NAV_DIRECTION_COOLDOWN = 500   # min steps between hand flips (counts frames)
 NAV_PLATEAU_STEPS = 2000       # steps without progress before trying next candidate
 NAV_ESCAPE_FORWARD = 150       # steps in escape burst to leave area
+NAV_HARD_TIMEOUT_STEPS = 12000 # absolute max nav steps before forced CHECKIN.
+                               # If we never arrive at goal_node, fire SEARCH at
+                               # current location: best guess > game timeout.
+                               # ~6–10 min of game time at typical engine pace.
 HAND_LEFT = "left"
 HAND_RIGHT = "right"
 LOW_CONF_AVG_SIM_THRESHOLD = 0.25
@@ -831,13 +835,16 @@ class KeyboardPlayerPyGame(Player):
         per_view_sorted = sorted(per_view_best, key=lambda x: -x[1])
         primary_node, primary_sim, primary_view = per_view_sorted[0]
 
-        # Lock onto the single strongest match (front view best). On the dry-run
-        # 51×51 dataset the per-view best matches are scattered across the
-        # trajectory (1077, 2351, 2971, 394) — cycling through them on plateau
-        # makes the agent bounce around without ever physically arriving at any
-        # of them. Sticking to the front-view best gives a stable target that
-        # SEARCH-verification can confirm or reject.
-        self.goal_candidates = [primary_node]
+        # Goal selection: primary = strongest single-view match (front-view's
+        # best DB frame). Candidates = each view's best, deduped. SEARCH-based
+        # verification at each candidate keeps cycling safe — we only CHECKIN
+        # if the 360° scan crosses SEARCH_SIM_LOW_CONF (0.18), so a wrong
+        # candidate just gets rejected and we move on rather than false-CHECKIN.
+        candidates_seen = []
+        for node, _sim, _name in per_view_sorted:
+            if not any(abs(node - c) <= GOAL_NEIGHBORHOOD_RADIUS for c in candidates_seen):
+                candidates_seen.append(node)
+        self.goal_candidates = candidates_seen[:LOW_CONF_GOAL_CANDIDATES]
         self.goal_candidate_index = 0
         self.goal_node = primary_node
 
@@ -1167,6 +1174,20 @@ class KeyboardPlayerPyGame(Player):
                 self.search_best_sim = 0.0
                 return Action.LEFT
 
+            # Hard timeout: agent might never physically reach goal_node under
+            # NOISY_MOTION + wall constraints. Better to fire SEARCH at current
+            # location than time out the game. SEARCH still verifies before
+            # CHECKIN, so this isn't a false positive — it's "best guess given
+            # what we know."
+            if self.nav_total_steps >= NAV_HARD_TIMEOUT_STEPS:
+                print(f"[PATH] Hard timeout at step {self.nav_total_steps} "
+                      f"(hops={hops}). Entering SEARCH at current location.")
+                self.nav_state = NavState.SEARCH
+                self.search_turn_counter = 0
+                self.search_scan_count = 0
+                self.search_best_sim = 0.0
+                return Action.LEFT
+
             # Near goal → SEARCH (legacy gradient-based path)
             if self._should_enter_search(hops):
                 print(f"[PATH] Near goal ({hops} hops), entering SEARCH")
@@ -1245,13 +1266,15 @@ class KeyboardPlayerPyGame(Player):
         if self.nav_state in (NavState.SEARCH, NavState.CHECKIN):
             return action
 
-        # Plateau detection: no progress → ESCAPE burst, retry SAME goal.
-        # We intentionally DO NOT switch candidates: the 4 per-view best matches
-        # are scattered across the trajectory (single-trajectory dataset, weak
-        # VLAD on noisy 51×51 maze), and switching makes us bounce around without
-        # ever reaching any of them. Lock onto the strongest front-view match.
+        # Plateau detection: no progress → ESCAPE burst + try next candidate.
+        # Cycling between candidates is safe now that visual-sim CHECKIN is gone:
+        # SEARCH-verification (sim ≥ 0.18) at each candidate gates CHECKIN,
+        # so reaching a wrong candidate just gets rejected, not false-CHECKIN'd.
         if (self.nav_total_steps - self.nav_plateau_start) >= NAV_PLATEAU_STEPS:
-            print(f"[NAV] Plateau at step {self.nav_total_steps}, ESCAPE to relocate (locked goal)")
+            if self.low_confidence_goal and self._advance_goal_candidate():
+                print(f"[NAV] Plateau at step {self.nav_total_steps}, switching candidate")
+            else:
+                print(f"[NAV] Plateau at step {self.nav_total_steps}, ESCAPE to relocate")
             self._escape_remaining = NAV_ESCAPE_FORWARD
             self.nav_state = NavState.ESCAPE
             self.nav_plateau_start = self.nav_total_steps
