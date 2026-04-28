@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data
+/data/
+/cache/
+vis_nav_player.log
+
+# Exploration data (large image datasets)
+exploration_data/
+exploration_data_midterm/
+exploration_data_real/
+
+# OS files
+.DS_Store
